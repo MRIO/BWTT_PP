@@ -1,0 +1,45 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% STEP 2: Combination of single tracks to whisker_tracks
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+close all
+clear
+tic
+
+%                                             experiment date
+%                                                   |  
+%                                                   V                                                   
+fldername        = ('\\192.168.225.37\WhiskStore\BWTT_output\180427\');
+blocks           = {'003'};
+%                      \
+%                       \
+%                       All blocks, like so: {'001','002','003'}
+
+
+video_foldername = 'V:\'; % Converted video folder
+
+% poolobj = gcp('nocreate');
+% if isempty(poolobj)
+%     parpool(4);
+% end
+
+tracking_parameters = struct( ...
+    'number_of_whiskers_in_video',        [4], ...    % Number of whisker to take the average from, more is better, but there are only so many whisker in the video
+    'min_number_of_whiskers_per_extrema', [4]-1, ...  % Number of whikers -1
+    'delta_t_to_get_away_from_extremum',  [30], ...   % All the following parameters can be tweaked, but that's usually not necessary when taking the average whisker trace
+    'peak_or_troughs',                    [1], ... 
+    'min_trough_depth',                   [5], ...
+    'simultaneous_trough_time_threshold', [5], ...
+    'min_trough_distance',                [50]);
+
+
+for curr_block = 1:length(blocks)
+
+    filelist{curr_block} = dir([fldername,blocks{curr_block},filesep,'*tracking_result.mat']);
+    process_step_2_par_C(filelist{curr_block},blocks{curr_block},fldername,video_foldername,tracking_parameters);
+end
+
+disp('All done =)');
+% matlabpool('close');
+
+toc

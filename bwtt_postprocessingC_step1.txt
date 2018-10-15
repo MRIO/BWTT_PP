@@ -1,0 +1,417 @@
+% close all;
+clear
+close all;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Run all bwtt-output files in this folder
+% This is usefull when the output is splitted in multiple smaller files
+tic
+% folder = 'Y:\BWTT_output\_BWTT_raw_data\161109\';
+result_foldername = '\\whiskhost\WhiskStore\BWTT_output\';
+
+exp_date = '180427';
+blocks = {'003'};
+
+folder = [result_foldername, '_BWTT_raw_data', filesep, exp_date, filesep];
+
+try
+    poolobj = gcp('nocreate');
+    if isempty(poolobj)
+        parpool(2);
+    end
+catch
+    matlabpool('open',2);
+end
+
+for curr_block = 1:length(blocks)
+    
+    foldername        =[folder,blocks{curr_block},filesep,'output',filesep];
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % bwtt_raw_pos      = strfind(foldername, 'BWTT_raw');
+    % filesep_pos       = strfind(foldername(1:bwtt_raw_pos), filesep);
+    % result_foldername = foldername(1:filesep_pos(end));
+    % result_foldername = '/mnt/converted_videos/150924-131709-002-00000-00000/002/';
+    
+    list              = dir([foldername,'*bwtt_output.mat']);
+    %
+    for curr_file = 1:length(list)
+        filename = list(curr_file).name;
+        disp(['Loading file ',filename,' (', num2str(curr_file),' of ',num2str(length(list)),')']);
+               
+        load([foldername filename]);
+        
+        tracking_flag               = 1;
+        save_tracking_results_flag  = 1;
+        
+        disp('Running...');
+        
+        parfor sel_job = 1:size(export.jobs,2)
+            disp(['Processing  job ', num2str(sel_job), ' from ',num2str(size(export.jobs,2))]);
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            % STEP 1: Calculate angle values for frames
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            whisker_trace = export.jobs{sel_job};
+            f1 = 1;%495000-export.jobs{sel_job}.frameIndices(1);
+            f2 = size(export.jobs{sel_job}.results, 2);%510000-export.jobs{sel_job}.frameIndices(1);
+            %
+            fs = 1000;
+            
+            % Find first frame with snout
+            snout_flag_array = zeros(1, size(whisker_trace.results, 2));
+            for n = 1: size(whisker_trace.results, 2)
+                snout_flag_array(n) = isfield(whisker_trace.results{n}, 'snout');
+            end
+            noseTip     = whisker_trace.results{find(snout_flag_array, 1, 'first')}.snout.noseTip;
+            noseCenter  = whisker_trace.results{find(snout_flag_array, 1, 'first')}.snout.center;
+            Nose_ref = noseTip - noseCenter;
+            %line([noseTip(1,1) noseCenter(1,1)],[noseTip(1,2) noseCenter(1,2)]);
+            %
+            all_angle_array         = NaN*zeros(20, f2, 2);
+            %
+            win_width = 81;
+            kernel = gausswin(win_width)/sum(gausswin(win_width));
+            %
+            for frame = f1:1:f2;
+                if isfield(export.jobs{sel_job}.results{frame}, 'whisker')
+                    whisker_total   = size(whisker_trace.results{frame}.whisker.contour, 2);
+                else
+                    whisker_total   = 0;
+                end
+                whisker_vector  = zeros(2, whisker_total);
+                angle_vector    = zeros(2, whisker_total);
+                for whisker_count = 1: whisker_total
+                    whisker_vector(:, whisker_count) =  whisker_trace.results{frame}.whisker.contour{whisker_count}(:, 2) - ...
+                        whisker_trace.results{frame}.whisker.contour{whisker_count}(:, 1);
+                    angle_vector(2, whisker_count) = atan2(abs(det([Nose_ref',whisker_vector(:, whisker_count)])), ...
+                        dot(Nose_ref',whisker_vector(:, whisker_count)));
+                    %
+                    angle_vector(1, whisker_count) = whisker_trace.results{frame}.whisker.contour{whisker_count}(1, 1);
+                end
+                %
+                angle_vector(2, :) = angle_vector(2, :)/pi*180;
+                all_angle_array(1: size(angle_vector, 2), frame, :) = angle_vector';
+            end
+            all_angle_array(find(all_angle_array == 0)) = deal(NaN);
+            %
+            if ~tracking_flag
+                figure;
+                subplot(2, 1, 1);
+                hold on;
+                for n = 1: size(all_angle_array, 1)
+                    scatter(export.jobs{sel_job}.frameIndices(f1:f2), all_angle_array(n, f1:f2, 2), 'MarkerEdgeColor', [.5 .5 .5], 'Marker', '.');
+                end
+                
+                subplot(2, 1, 2);
+                hold on;
+                for n = 1: size(all_angle_array, 1)
+                    scatter(export.jobs{sel_job}.frameIndices(f1:f2), all_angle_array(n, f1:f2, 1), 'MarkerEdgeColor', [.5 .5 .5], 'Marker', '.');
+                end
+            else
+                % figure
+                % %
+                % s(1) = subplot(2,1,1);
+                % hold on;
+                % %
+                % %% Whisker Tracking
+                % s(2) = subplot(2,1,2);
+                % hold on;
+                %
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                % STEP 2: Kalman-like Tracking
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                %
+                curr_valid_tracks   = [];
+                track_gatherer      = [];
+                %
+                tmp_track_struct        = struct(   'id',                       [], ...
+                    'time_vector',              [], ...
+                    'angle_vector',             [], ...
+                    'x1pos_vector',             [], ...
+                    'fit_to_angle_vector',      [], ...
+                    'fit_error',                [], ...
+                    'fit_error_vector',         [], ...
+                    'missed_frames',            0, ...
+                    'missed_frames_angle',      [], ...
+                    'missed_frames_x1pos',      [], ...
+                    'validity_flag',            0);
+                %
+                id_counter              = 0;
+                angular_threshold       = 15;
+                position_threshold      = 15;
+                missed_frames_threshold = 3;
+                %
+                %
+                for frame = f1: f2
+                    new_angle_vector            = (all_angle_array((~isnan(all_angle_array(:, frame, 2))), frame, 2));
+                    [new_angle_vector, sequ]    = sort(new_angle_vector, 'descend');
+                    new_x1pos_vector            = (all_angle_array((~isnan(all_angle_array(:, frame, 1))), frame, 1));
+                    new_x1pos_vector            = new_x1pos_vector(sequ);
+                    %
+                    % PREDICTION: Check valid tracks for best
+                    if ~isempty(curr_valid_tracks)
+                        if ~isempty(vertcat(curr_valid_tracks(:).fit_error)) && sum(vertcat(curr_valid_tracks(:).fit_error) < 999)
+                            %select track with smallest fit error and more than x sample points, take his prediction
+                            %
+                            [~, fit_pos]    = min(vertcat(curr_valid_tracks(:).fit_error));
+                            curr_angle_prediction = curr_valid_tracks(fit_pos).fit_to_angle_vector(end)-curr_valid_tracks(fit_pos).fit_to_angle_vector(end-1);
+                            %
+                            %             % Plot fit
+                            %             plot(   curr_valid_tracks(fit_pos).time_vector(end-5: end), ...
+                            %                     curr_valid_tracks(fit_pos).fit_to_angle_vector, ...
+                            %                     'Color', 'm');
+                            %             subplot(2,1,1);
+                            %             line(   [frame-1 frame-1], ...
+                            %                     [curr_valid_tracks(fit_pos).fit_to_angle_vector(end)-5 curr_valid_tracks(fit_pos).fit_to_angle_vector(end)+5], ...
+                            %                     'Color', 'm');
+                        else
+                            curr_angle_prediction = 0;
+                        end
+                    else
+                        curr_angle_prediction = 0;
+                    end
+                    %
+                    % Extrapolate all valid tracks with current prediction (gives us
+                    % predicted positions of current frame)
+                    if ~isempty(curr_valid_tracks)
+                        if sum(ismember(vertcat(curr_valid_tracks.validity_flag), [1 2 3])) % tmp, valid or missed_frame
+                            % update current tracks with current prediction, remove used
+                            % updates from new_angle_vector (set to NaN)
+                            %
+                            % Get last angle of valid tracks (real position for validity
+                            % _flag == [1 2], extrapolated position for missed_frame_track
+                            current_tracks                  = find(ismember(vertcat(curr_valid_tracks.validity_flag), [1 2 3]));
+                            %
+                            curr_frame_diff_angle_minima    = NaN*zeros(length(current_tracks), size(new_angle_vector, 1));
+                            %
+                            % Iterate three times through tracks, update valid tracks
+                            % first, missed tracks second and tmp tracks last
+                            new_angle_vector_for_min_detection = new_angle_vector;
+                            for curr_update_loop = [2 3 1]
+                                last_angle_of_current_tracks    = NaN*zeros(length(current_tracks), 1);
+                                last_x1pos_of_current_tracks    = NaN*zeros(length(current_tracks), 1);
+                                %
+                                if sum(curr_update_loop == [1 2]) == 1
+                                    current_loop_tracks                     = find(ismember(vertcat(curr_valid_tracks.validity_flag), curr_update_loop));
+                                    last_angle_of_valid_tracks              = arrayfun(@(n) curr_valid_tracks(n).angle_vector(end), current_loop_tracks);
+                                    last_angle_of_current_tracks(current_loop_tracks) = last_angle_of_valid_tracks;
+                                    %
+                                    last_x1pos_of_valid_tracks              = arrayfun(@(n) curr_valid_tracks(n).x1pos_vector(end), current_loop_tracks);
+                                    last_x1pos_of_current_tracks(current_loop_tracks) = last_x1pos_of_valid_tracks;
+                                else
+                                    % Add missed tracks
+                                    current_loop_tracks                     = find(ismember(vertcat(curr_valid_tracks.validity_flag), [3]));
+                                    last_angle_of_missed_tracks             = arrayfun(@(n) curr_valid_tracks(n).missed_frames_angle(end), current_loop_tracks);
+                                    last_angle_of_current_tracks(current_loop_tracks) = last_angle_of_missed_tracks;
+                                    %
+                                    last_x1pos_of_missed_tracks             = arrayfun(@(n) curr_valid_tracks(n).missed_frames_x1pos(end), current_loop_tracks);
+                                    last_x1pos_of_current_tracks(current_loop_tracks) = last_x1pos_of_missed_tracks;
+                                end
+                                % Extrapolate all tracks by angular prediction
+                                last_angle_of_current_tracks  = last_angle_of_current_tracks+curr_angle_prediction;
+                                %
+                                %
+                                % Extrapolate all tracks by position prediction (+0 currently)
+                                %last_x1pos_of_current_tracks  = last_x1pos_of_current_tracks+curr_x1pos_prediction;
+                                %
+                                % Calculate angular+position difference between current frame pair
+                                curr_frame_diff_angle = zeros(sum(~isnan(last_angle_of_current_tracks)), size(new_angle_vector, 1));
+                                curr_frame_diff_x1pos = zeros(sum(~isnan(last_angle_of_current_tracks)), size(new_angle_vector, 1));
+                                for n = 1: length(last_angle_of_current_tracks)
+                                    curr_frame_diff_angle(n, :) = arrayfun( @(curr_value)   (last_angle_of_current_tracks(n, 1)-new_angle_vector_for_min_detection(curr_value, 1)), 1:size(new_angle_vector, 1));
+                                    curr_frame_diff_x1pos(n, :) = arrayfun( @(curr_value)   (last_x1pos_of_current_tracks(n, 1)-new_x1pos_vector(curr_value, 1)), 1:size(new_angle_vector, 1));
+                                end
+                                %
+                                % Search for minimum pairs, allow only a single value per row &
+                                % column
+                                %
+                                %             pos                                     = find( (abs(curr_frame_diff_angle)+abs(curr_frame_diff_x1pos) < 20));
+                                
+                                pos                                     = find( (abs(curr_frame_diff_angle) < angular_threshold) & ...
+                                    (abs(curr_frame_diff_x1pos) < position_threshold));
+                                if isempty(pos)
+                                    % This means that there are no current
+                                    % tracks are being updated because the
+                                    % potential new tracks are out of tolerance
+                                    % bounds in angle and/or position
+                                    continue
+                                end
+                                %
+                                % current weight of angle and position is 1:1
+                                curr_frame_diff_angle_blw_thrshld       = NaN*zeros(size(curr_frame_diff_angle));
+                                curr_frame_diff_angle_blw_thrshld(pos)  = abs(curr_frame_diff_angle(pos))+abs(curr_frame_diff_x1pos(pos));
+                                %
+                                % Find minima positions between data points in current frames
+                                for curr_dim_step = 1: size(curr_frame_diff_angle_blw_thrshld, 2)
+                                    curr_min_val = nanmin(nanmin(abs(curr_frame_diff_angle_blw_thrshld)));
+                                    curr_min_pos = find(abs(curr_frame_diff_angle_blw_thrshld) <= curr_min_val+.0001);
+                                    %
+                                    if size(curr_min_pos, 1) == 1 % single min value detected
+                                        [curr_min_pos_x, curr_min_pos_y] = find(abs(curr_frame_diff_angle_blw_thrshld) <= curr_min_val+.0001);
+                                        curr_frame_diff_angle_minima(curr_min_pos_x, curr_min_pos_y) = curr_frame_diff_angle_blw_thrshld(curr_min_pos_x, curr_min_pos_y);
+                                        curr_frame_diff_angle_blw_thrshld(curr_min_pos_x, :) = deal(NaN);
+                                        curr_frame_diff_angle_blw_thrshld(:, curr_min_pos_y) = deal(NaN);
+                                        %
+                                        new_angle_vector_for_min_detection(curr_min_pos_y) = NaN;
+                                    elseif size(curr_min_pos, 1) > 1 % multiple min values detected
+                                        [curr_min_pos_x, curr_min_pos_y] = find(abs(curr_frame_diff_angle_blw_thrshld) <= curr_min_val+.0001);
+                                        % Pick the pair that is in closer row-column
+                                        [~, pos] = min(abs(curr_min_pos_x-curr_min_pos_y));
+                                        curr_min_pos_x = curr_min_pos_x(pos);
+                                        curr_min_pos_y = curr_min_pos_y(pos);
+                                        %
+                                        curr_frame_diff_angle_minima(curr_min_pos_x, curr_min_pos_y) = curr_frame_diff_angle_blw_thrshld(curr_min_pos_x, curr_min_pos_y);
+                                        curr_frame_diff_angle_blw_thrshld(curr_min_pos_x, :) = deal(NaN);
+                                        curr_frame_diff_angle_blw_thrshld(:, curr_min_pos_y) = deal(NaN);
+                                        %
+                                        new_angle_vector_for_min_detection(curr_min_pos_y) = NaN;
+                                    end
+                                end
+                            end
+                            %
+                            % Update selected tracks with current frame data
+                            [valid_track_pos, new_data_pos] = find(~isnan(curr_frame_diff_angle_minima));
+                            %
+                            if ~isempty(valid_track_pos)
+                                for curr_track_update = 1: size(valid_track_pos, 1)
+                                    curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).time_vector = ...
+                                        [curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).time_vector ...
+                                        frame];
+                                    curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).angle_vector = ...
+                                        [curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).angle_vector ...
+                                        new_angle_vector(new_data_pos(curr_track_update))];
+                                    curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).x1pos_vector = ...
+                                        [curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).x1pos_vector ...
+                                        new_x1pos_vector(new_data_pos(curr_track_update))];
+                                    %
+                                    % Reset missed frame counter
+                                    curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).missed_frames = 0;
+                                    curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).missed_frames_angle = [];
+                                    curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).missed_frames_x1pos = [];
+                                    %
+                                    % Change validity flag status 1->2
+                                    if length(curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).angle_vector) > 5
+                                        curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).validity_flag = 2;
+                                        %
+                                        % Calculate fit of current track
+                                        [curr_fit, fit_gof] = fit((1:6)', curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).angle_vector(end-5: end)', 'poly2');
+                                        curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).fit_to_angle_vector   = feval(curr_fit, 1:6);
+                                        curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).fit_error             = fit_gof.sse;
+                                    else
+                                        curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).validity_flag = 1;
+                                        %
+                                        curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).fit_to_angle_vector   = [];
+                                        curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).fit_error           = 999;
+                                    end
+                                    %
+                                    % Gather fit errors (this was implemented
+                                    % late and is used for the combination of
+                                    % troughs  when tracks for entire whiskers
+                                    % are created
+                                    curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).fit_error_vector = ...
+                                        [curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).fit_error_vector ...
+                                        curr_valid_tracks(current_tracks(valid_track_pos(curr_track_update))).fit_error];
+                                    %
+                                    new_angle_vector(new_data_pos(curr_track_update)) = NaN;
+                                    new_x1pos_vector(new_data_pos(curr_track_update)) = NaN;
+                                end
+                            else
+                                % no valid track updates for current track type
+                                % (init, valid or missed)
+                            end
+                            %
+                            % Check tracks which were not updated
+                            non_updated_tracks = setxor(current_tracks', valid_track_pos');
+                            if ~isempty(non_updated_tracks)
+                                for curr_non_updated_track = size(non_updated_tracks, 2): -1: 1
+                                    curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames = ...
+                                        curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames + 1;
+                                    %
+                                    curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).fit_to_angle_vector   = [];
+                                    curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).fit_error             = 999;
+                                    %
+                                    if curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames > missed_frames_threshold
+                                        % Move track from valid tracks to track gatherer
+                                        new_gatherer_track  = size(track_gatherer, 2)+1;
+                                        track_gatherer      = [track_gatherer curr_valid_tracks(non_updated_tracks(curr_non_updated_track))];
+                                        curr_valid_tracks(non_updated_tracks(curr_non_updated_track)) = [];
+                                        %
+                                        track_gatherer(new_gatherer_track).validity_flag = 4;
+                                    else
+                                        curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).validity_flag = 3;
+                                        %
+                                        if curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames == 1
+                                            curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames_angle = ...
+                                                [curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames_angle ...
+                                                curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).angle_vector(end)+curr_angle_prediction];
+                                            curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames_x1pos = ...
+                                                [curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames_x1pos ...
+                                                curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).x1pos_vector(end)];
+                                        else
+                                            curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames_angle = ...
+                                                [curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames_angle ...
+                                                curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames_angle(end)+curr_angle_prediction];
+                                            curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames_x1pos = ...
+                                                [curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames_x1pos ...
+                                                curr_valid_tracks(non_updated_tracks(curr_non_updated_track)).missed_frames_x1pos(end)];
+                                        end
+                                    end
+                                end
+                            end
+                            %
+                        end
+                    end
+                    %
+                    % Create new temp tracks from unassigned data points
+                    if sum(~isnan(new_angle_vector))
+                        pos = find(~isnan(new_angle_vector));
+                        %
+                        for curr_pos = pos'
+                            % Create new tmp track
+                            new_track           = size(curr_valid_tracks, 2)+1;
+                            curr_valid_tracks   = [curr_valid_tracks tmp_track_struct];
+                            %
+                            id_counter = id_counter+1;
+                            curr_valid_tracks(new_track).id                     = id_counter;
+                            curr_valid_tracks(new_track).validity_flag          = 1;
+                            curr_valid_tracks(new_track).missed_frames          = 0;
+                            curr_valid_tracks(new_track).missed_frames_angle    = [];
+                            curr_valid_tracks(new_track).time_vector            = frame;
+                            curr_valid_tracks(new_track).angle_vector           = new_angle_vector(curr_pos);
+                            curr_valid_tracks(new_track).x1pos_vector           = new_x1pos_vector(curr_pos);
+                            curr_valid_tracks(new_track).fit_error              = 999;
+                            curr_valid_tracks(new_track).fit_error_vector       = 999;
+                            % fits are calculated when track becomes valid (>= 5 data
+                            % points)
+                        end
+                    end
+                    %
+                    if ~mod(frame, 100)
+                        disp(['Processing at ', num2str(100*((frame-f1)/(f2-f1))), '%']);
+                    end
+                end
+                %
+                
+                disp('Saving data...');
+                processed_frames     = [min(export.jobs{sel_job}.frameIndices) max(export.jobs{sel_job}.frameIndices)];
+                file_base_name_date  = export.jobs{sel_job}.videoBasename(1:7);
+                file_base_name_block = export.jobs{sel_job}.videoBasename(15:17);
+                track_gatherer       = [track_gatherer curr_valid_tracks];
+                
+                
+                if exist([result_foldername file_base_name_date(1:end-1) ,filesep, file_base_name_block], 'dir')
+                    % Save vars using function to use it with parfor
+                    save_step1_C_output(result_foldername, file_base_name_date, file_base_name_block, processed_frames, export, track_gatherer, f1, f2, tmp_track_struct)
+                else
+                    mkdir([result_foldername file_base_name_date(1:end-1) ,filesep, file_base_name_block]);
+                    save_step1_C_output(result_foldername, file_base_name_date, file_base_name_block, processed_frames, export, track_gatherer, f1, f2, tmp_track_struct)
+                end
+            end
+        end
+        
+    end
+    disp(['Done with block ',blocks{curr_block}]);
+end
+
+% matlabpool('close');
+
+toc

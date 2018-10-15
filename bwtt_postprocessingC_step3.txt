@@ -1,0 +1,103 @@
+%% Create one whisker trace per block: angle, time and fanning
+
+clear
+close all
+
+% Get stim-stiggered whisker movements
+exp_date        = '180501'; % experiment date
+save_mat_data   = 1;
+
+foldername = 'Z:\BWTT_output\';
+folderlist_tmp = dir([foldername,exp_date,filesep]);
+folderlist = folderlist_tmp(3:end);
+
+%% folderlist(2,:) = [];
+
+for curr_block = 1:size(folderlist,1)
+    
+    block = folderlist(curr_block).name;
+    disp(['Running block ', block]);
+    
+    % Whisker variables
+    whisker_angle_vector   = [];
+    whisker_time_vector    = [];
+    whisker_fanning_vector = [];
+    whisker_framenr_vector = [];
+    sort_id = [];
+    whisker_data = {};
+    
+    % whisker_foldername     = strcat('/home/s/_data/BWTT/', exp_date, sprintf('/%03d/',block));
+    whisker_foldername     = [foldername , exp_date, filesep, block, filesep];
+    whisker_files          = dir([whisker_foldername,'*tracked_by_average_C.mat']);
+    
+    if size(whisker_files,1) > 0
+        whisker_time_offset    = 0; %-find(~isnan(tdt_time_vector_corrected),1);
+        
+        
+        % Get all tracked whisker data
+        disp(' + Loading data...');
+        for curr_whisker_file = 1:size(whisker_files,1)
+            disp(['   - File ',num2str(curr_whisker_file),' of ',num2str(size(whisker_files,1))]);
+            load([whisker_foldername whisker_files(curr_whisker_file).name]);
+            whisker_data{curr_whisker_file} = combined_unique_whisker_tracks;
+        end
+        
+        disp(' + Processing...');
+        % Sort the files by frames
+        for curr_whisker_data = 1:length(whisker_data)
+            sort_id(curr_whisker_data) = whisker_data{curr_whisker_data}.framenumber_vector(1);
+        end
+        [~, id_sort] = sort(sort_id);
+        
+        
+        % Combine into one
+        for curr_whisker_data = id_sort
+            
+            % Only use data with timestamps
+            if (~isempty(whisker_data{curr_whisker_data}.time_vector') &&...
+                    length(whisker_data{curr_whisker_data}.time_vector') == length(whisker_data{curr_whisker_data}.angle_vector))
+                whisker_angle_vector   = [whisker_angle_vector whisker_data{curr_whisker_data}.angle_vector];
+                whisker_time_vector    = [whisker_time_vector whisker_data{curr_whisker_data}.time_vector'];
+                whisker_fanning_vector = [whisker_fanning_vector whisker_data{curr_whisker_data}.angle_fanning];
+            end
+        end
+        
+        %
+        whisker_angle_vector(isnan(whisker_angle_vector)) = 0;
+        whisker_fanning_vector(isnan(whisker_fanning_vector)) = 0;
+        fs = 1000;
+        
+        % Smoothen the whisker-trace a bit with a low-pass filter @ 50 Hz...
+        fNorm_whisk = 50 / (fs/2);
+        [b_whisk,a_whisk] = butter(10, fNorm_whisk, 'low');
+        whisker_angle_vector = filtfilt(b_whisk, a_whisk, whisker_angle_vector);
+        whisker_fanning_vector = filtfilt(b_whisk, a_whisk, whisker_fanning_vector);
+        
+%         fNorm_high = 1 / (fs/2);                      % cutoff frequency (to 'normalize')
+%         [b_high,a_high] = butter(3, fNorm_high, 'high');    % generates some vectors, b and a, the filter needs,
+%         whisker_angle_vector = filtfilt(b_high, a_high, whisker_angle_vector);              % apply low-pass filter
+        
+        if save_mat_data
+            disp(' + Saving data...');
+            save([whisker_foldername, exp_date, '_', block, '_', 'WhiskTraceComplete_C_bwtt.mat'], 'whisker_angle_vector', 'whisker_time_vector', 'whisker_fanning_vector');
+        end
+        disp('Done!');
+        
+    else
+        disp(['No data to process for block ',block]);
+    end
+    
+end
+
+disp('Done =)');
+
+% %%
+% 
+% figure; 
+% 
+% load('/home/s/Documents/code/matlab/whiskers/read_C_BWTT_ouput/170111/004/170111_004_WhiskTraceComplete_C_bwtt.mat');
+% plot(whisker_time_vector, whisker_angle_vector);
+% hold on;
+% 
+% load('/home/s/Documents/code/matlab/whiskers/read_C_BWTT_ouput/170111/004/170111_004_WhiskTraceComplete.mat');
+% plot(whisker_time_vector, whisker_angle_vector);
